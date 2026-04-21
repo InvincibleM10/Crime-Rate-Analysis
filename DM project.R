@@ -1,0 +1,185 @@
+# India Crime Dataset - Exploratory & Predictive Analysis
+
+required_packages <- c("tidyverse", "caret", "cluster", "arules", "arulesViz", "readxl", "corrplot")
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    message("Installing: ", pkg)
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Configuration
+
+DATA_PATH   <- "C:/Users/Meran/OneDrive/Documents/crime_dataset_ind.csv.xlsx"
+SEED        <- 123
+K_CLUSTERS  <- 3
+TRAIN_RATIO <- 0.8
+APRIORI_SUP <- 0.1
+APRIORI_CON <- 0.5
+
+# Data loading and cleaning
+
+load_and_clean <- function(path) {
+  message("Loading data from: ", path)
+  df <- read_excel(path)
+  
+  # Standardise column names (no spaces / special chars)
+  colnames(df) <- make.names(colnames(df))
+  
+  message(sprintf("Loaded %d rows × %d columns", nrow(df), ncol(df)))
+  print(str(df))
+  
+  # Impute missing values
+  df <- df %>%
+    mutate(across(where(is.numeric),   ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+    mutate(across(where(is.character), ~ ifelse(is.na(.), "Unknown", .)))
+  
+  # Coerce types
+  df <- df %>%
+    mutate(across(where(is.character), as.factor),
+           Victim.Age       = as.numeric(Victim.Age),
+           Police.Deployed  = as.numeric(Police.Deployed))
+  
+  df
+}
+
+data <- load_and_clean(DATA_PATH)
+
+# Exploratory data analysis
+
+plot_bar <- function(df, col, fill_colour, title, angle = 0) {
+  ggplot(df, aes(x = .data[[col]])) +
+    geom_bar(fill = fill_colour) +
+    labs(title = title, x = col, y = "Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = angle, hjust = if (angle > 0) 1 else 0.5))
+}
+
+plot_bar(data, "Crime.Description", "skyblue",  "Crime Type Distribution",      angle = 90)
+plot_bar(data, "City",              "steelblue", "Crimes by City",               angle = 90)
+plot_bar(data, "Crime.Domain",      "darkgreen", "Crime Domain Distribution",    angle = 90)
+plot_bar(data, "Victim.Gender",     "purple",    "Victim Gender Distribution")
+plot_bar(data, "Weapon.Used",       "red",       "Weapons Used in Crimes",       angle = 90)
+plot_bar(data, "Case.Closed",       "cyan",      "Case Closure Status")
+
+# Age histogram
+ggplot(data, aes(x = Victim.Age)) +
+  geom_histogram(bins = 20, fill = "orange", colour = "white") +
+  labs(title = "Victim Age Distribution", x = "Age", y = "Count") +
+  theme_minimal()
+
+# Correlation heatmap (numeric columns only)
+numeric_data <- data %>% select(where(is.numeric))
+if (ncol(numeric_data) >= 2) {
+  cor_matrix <- cor(numeric_data, use = "complete.obs")
+  corrplot(cor_matrix, method = "circle", tl.cex = 0.8, title = "Correlation Matrix")
+} else {
+  message("Not enough numeric columns for a correlation matrix.")
+}
+
+# Clustering
+
+cluster_input <- data %>%
+  select(Victim.Age, Police.Deployed) %>%
+  na.omit() %>%
+  scale() %>%           # standardise before k-means
+  as.data.frame()
+
+set.seed(SEED)
+kmeans_model <- kmeans(cluster_input, centers = K_CLUSTERS, nstart = 25)
+
+# Silhouette score — higher is better (range: -1 to 1)
+sil <- silhouette(kmeans_model$cluster, dist(cluster_input))
+message(sprintf("Mean silhouette score (k=%d): %.3f", K_CLUSTERS, mean(sil[, 3])))
+
+# Attach clusters to original rows
+data$Cluster <- NA_integer_
+data$Cluster[as.integer(rownames(cluster_input))] <- kmeans_model$cluster
+
+ggplot(cluster_input, aes(x = Victim.Age, y = Police.Deployed,
+                          colour = as.factor(kmeans_model$cluster))) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  labs(title  = "Crime Clusters (k-means, scaled features)",
+       colour = "Cluster",
+       x      = "Victim Age (scaled)",
+       y      = "Police Deployed (scaled)") +
+  theme_minimal()
+
+# Supervised learning - case closure prediction
+
+# Remove the cluster column to avoid leakage; keep only complete rows
+data_model <- data %>%
+  select(-Cluster) %>%
+  na.omit() %>%
+  mutate(Case.Closed = as.factor(Case.Closed))
+
+# Check class balance
+message("Class distribution:")
+print(prop.table(table(data_model$Case.Closed)))
+
+set.seed(SEED)
+train_idx  <- createDataPartition(data_model$Case.Closed, p = TRAIN_RATIO, list = FALSE)
+train_data <- data_model[ train_idx, ]
+test_data  <- data_model[-train_idx, ]
+
+# Shared train control (5-fold CV)
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE,
+                     summaryFunction = twoClassSummary, verboseIter = FALSE)
+
+evaluate_model <- function(model, test, label) {
+  preds <- predict(model, test)
+  cm    <- confusionMatrix(preds, test$Case.Closed)
+  message(sprintf("\n%s results:", label))
+  print(cm)
+  invisible(cm)
+}
+
+# Decision Tree
+message("Training Decision Tree...")
+dt_model <- train(Case.Closed ~ ., data = train_data, method = "rpart",
+                  trControl = ctrl, metric = "ROC")
+evaluate_model(dt_model, test_data, "Decision Tree")
+
+# Naïve Bayes
+message("Training Naïve Bayes...")
+nb_model <- train(Case.Closed ~ ., data = train_data, method = "nb",
+                  trControl = ctrl, metric = "ROC")
+evaluate_model(nb_model, test_data, "Naïve Bayes")
+
+# Quick model comparison
+results <- resamples(list(DecisionTree = dt_model, NaiveBayes = nb_model))
+summary(results)
+dotplot(results, main = "Model Comparison (5-fold CV)")
+
+# Association rule mining
+
+rule_vars <- c("City", "Crime.Description", "Weapon.Used", "Crime.Domain")
+
+rule_data <- data_model %>%
+  select(all_of(rule_vars)) %>%
+  mutate(across(everything(), as.factor))
+
+trans <- as(rule_data, "transactions")
+
+message(sprintf("Transaction summary: %d items, %d transactions",
+                nitems(trans), length(trans)))
+
+rules <- apriori(trans,
+                 parameter = list(supp = APRIORI_SUP,
+                                  conf = APRIORI_CON,
+                                  minlen = 2))
+
+message(sprintf("Rules generated: %d", length(rules)))
+
+if (length(rules) > 0) {
+  # Show top 10 by lift
+  top_rules <- sort(rules, by = "lift")[1:min(10, length(rules))]
+  inspect(top_rules)
+  plot(rules, method = "scatter", measure = c("support", "confidence"),
+       shading = "lift", jitter = 0)
+} else {
+  message("No rules found — try lowering support or confidence thresholds.")
+}
+
